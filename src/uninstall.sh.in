@@ -1,0 +1,55 @@
+#!/bin/zsh
+
+emulate -L zsh
+set -uo pipefail
+
+ROOT='@CWW_ROOT@'
+LOG_DIR='@CWW_LOG_DIR@'
+PLIST='@LAUNCH_AGENT_PLIST@'
+LABEL='com.local.claude-window-warmup'
+
+print -r -- "Uninstalling $LABEL"
+
+if [[ -f $PLIST ]]; then
+  launchctl bootout "gui/$(id -u)" "$PLIST" 2>/dev/null \
+    && print -r -- "  booted out $LABEL" \
+    || print -r -- "  $LABEL was not loaded"
+  /bin/rm -f -- "$PLIST"
+  print -r -- "  removed $PLIST"
+fi
+
+for target in \
+  "$ROOT/run/warmup-check.sh" \
+  "$ROOT/bin/limitping" \
+  "$ROOT/config/limitping/config.toml" \
+  "$ROOT/run/last-attempt" \
+  "$ROOT/run/last-success" \
+  "$ROOT/run/last-trigger-at" \
+  "$ROOT/SOURCE_VERSION"
+do
+  [[ -e $target ]] || continue
+  /bin/rm -f -- "$target"
+  print -r -- "  removed $target"
+done
+
+for dir in \
+  "$ROOT/run/lock" \
+  "$ROOT/run/workdir" \
+  "$ROOT/config/limitping" \
+  "$ROOT/config" \
+  "$ROOT/bin" \
+  "$ROOT/run"
+do
+  [[ -d $dir ]] || continue
+  /bin/rm -rf -- "$dir"
+  print -r -- "  removed $dir"
+done
+
+/bin/rm -f -- "$ROOT/uninstall.sh"
+/bin/rmdir -- "$ROOT" 2>/dev/null && print -r -- "  removed $ROOT"
+
+print -r -- ""
+print -r -- "Logs were kept at: $LOG_DIR"
+print -r -- "Review them before deleting them manually."
+print -r -- "Claude Code, its credentials, global configuration, unrelated"
+print -r -- "CCLimitPing installations, and power settings were not touched."

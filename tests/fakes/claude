@@ -1,0 +1,15 @@
+#!/bin/zsh
+# Fake claude CLI. Only `auth status --json` is exercised by the wrapper.
+emulate -L zsh
+set -uo pipefail
+
+print -r -- "claude $*" >> "$FAKE_CALLS"
+
+if [[ ${1:-} == auth && ${2:-} == status ]]; then
+  [[ -f "$FAKE_SANDBOX/auth.json" ]] && cat "$FAKE_SANDBOX/auth.json"
+  if [[ -f "$FAKE_SANDBOX/auth.rc" ]]; then
+    exit "$(cat "$FAKE_SANDBOX/auth.rc")"
+  fi
+  exit 0
+fi
+exit 0

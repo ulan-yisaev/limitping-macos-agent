@@ -1,0 +1,33 @@
+#!/bin/zsh
+# Fake limitping. Records every invocation and replays scripted responses.
+emulate -L zsh
+set -uo pipefail
+
+print -r -- "limitping $*" >> "$FAKE_CALLS"
+
+case "${1:-}" in
+  status)
+    n=$(( $(cat "$FAKE_SANDBOX/status.count" 2>/dev/null || print 0) + 1 ))
+    print -r -- "$n" > "$FAKE_SANDBOX/status.count"
+    body="$FAKE_SANDBOX/status.$n.json"
+    rcf="$FAKE_SANDBOX/status.$n.rc"
+    [[ -f $body ]] || body="$FAKE_SANDBOX/status.1.json"
+    [[ -f $rcf ]] || rcf="$FAKE_SANDBOX/status.1.rc"
+    [[ -f $body ]] && cat "$body"
+    if [[ -f $rcf ]]; then
+      exit "$(cat "$rcf")"
+    fi
+    exit 0
+    ;;
+  ping)
+    print -r -- "PING_CWD=$PWD" >> "$FAKE_CALLS"
+    print -r -- "PING_XDG=${XDG_CONFIG_HOME:-unset}" >> "$FAKE_CALLS"
+    print -r -- "PING_HISTFLAG=${CLAUDE_CODE_SKIP_PROMPT_HISTORY:-unset}" >> "$FAKE_CALLS"
+    if [[ -n ${FAKE_PING_SLEEP:-} ]]; then
+      sleep "$FAKE_PING_SLEEP"
+    fi
+    print -r -- "claude   ok"
+    exit "${FAKE_PING_RC:-0}"
+    ;;
+esac
+exit 0

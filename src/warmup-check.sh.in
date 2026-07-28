@@ -1,0 +1,589 @@
+#!/bin/zsh
+#
+# ClaudeWindowWarmup - start the next Claude Code 5h subscription window.
+#
+# Runs cheaply every 5 minutes from a LaunchAgent. Almost every run exits after
+# a few local checks; a real Claude request only happens when the 5h window is
+# genuinely inactive. The Mac is never woken and Claude is never invoked with
+# the MacBook lid closed.
+#
+# Exit codes:
+#   0  ok (window started and verified, or deliberately skipped)
+#   3  guard failure (auth / provider override / missing binary)
+#   4  usage status could not be read or parsed
+#   5  trigger failed
+#   6  trigger returned 0 but the window did not become active
+#   7  trigger timed out
+
+emulate -L zsh
+set -euo pipefail
+
+# --- Installation paths (absolute; never derived from $HOME) ----------------
+
+CWW_ROOT='@CWW_ROOT@'
+CWW_LOG_DIR='@CWW_LOG_DIR@'
+CWW_CLAUDE_BIN='@CWW_CLAUDE_BIN@'
+CWW_CLAUDE_PATH_DIR='@CWW_CLAUDE_PATH_DIR@'
+CWW_USER_HOME='@CWW_USER_HOME@'
+
+# --- Tunables ---------------------------------------------------------------
+
+FAILURE_COOLDOWN=1800   # seconds to wait after a failed real attempt
+TRIGGER_SAFETY_FLOOR=18060 # no second ping for 5h1m after a successful trigger
+PING_TIMEOUT=90         # outer timeout around the interactive trigger
+STATUS_TIMEOUT=45       # outer timeout around a usage status read
+VERIFY_DELAY=10         # settle time between verification polls
+VERIFY_ATTEMPTS=4       # usage endpoint can lag a fresh window by ~30s
+WEEKLY_THRESHOLD_PCT=99 # skip at or above this weekly utilization
+RESET_BUFFER=10         # seconds to wait past a window reset before pinging
+WINDOW_MAX_SECONDS=18300 # sanity ceiling for a "5h" window (5h + 5m)
+WINDOW_WARN_SECONDS=14400 # below this, a fresh window looks unexpectedly short
+LOG_MAX_BYTES=2097152   # rotate warmup.log at 2 MiB
+LOG_KEEP=5              # historical logs retained
+
+# The test-only overrides below are never set by the production plist. They
+# exist so the wrapper can be exercised against fake claude/limitping binaries.
+if [[ ${CLAUDE_WARMUP_TEST_MODE:-0} == 1 ]]; then
+  CWW_ROOT=${CLAUDE_WARMUP_TEST_ROOT:-$CWW_ROOT}
+  CWW_LOG_DIR=${CLAUDE_WARMUP_TEST_LOG_DIR:-$CWW_LOG_DIR}
+  CWW_CLAUDE_BIN=${CLAUDE_WARMUP_TEST_CLAUDE_BIN:-$CWW_CLAUDE_BIN}
+  CWW_CLAUDE_PATH_DIR=${CLAUDE_WARMUP_TEST_PATH_DIR:-$CWW_CLAUDE_PATH_DIR}
+  CWW_USER_HOME=${CLAUDE_WARMUP_TEST_HOME:-$CWW_USER_HOME}
+  FAILURE_COOLDOWN=${CLAUDE_WARMUP_TEST_COOLDOWN:-$FAILURE_COOLDOWN}
+  TRIGGER_SAFETY_FLOOR=${CLAUDE_WARMUP_TEST_TRIGGER_SAFETY_FLOOR:-$TRIGGER_SAFETY_FLOOR}
+  PING_TIMEOUT=${CLAUDE_WARMUP_TEST_PING_TIMEOUT:-$PING_TIMEOUT}
+  VERIFY_DELAY=${CLAUDE_WARMUP_TEST_VERIFY_DELAY:-$VERIFY_DELAY}
+  VERIFY_ATTEMPTS=${CLAUDE_WARMUP_TEST_VERIFY_ATTEMPTS:-$VERIFY_ATTEMPTS}
+  LOG_MAX_BYTES=${CLAUDE_WARMUP_TEST_LOG_MAX_BYTES:-$LOG_MAX_BYTES}
+fi
+
+LIMITPING_BIN="$CWW_ROOT/bin/limitping"
+CONFIG_HOME="$CWW_ROOT/config"
+RUN_DIR="$CWW_ROOT/run"
+WORK_DIR="$RUN_DIR/workdir"
+LOCK_ROOT="$RUN_DIR/lock"
+LOCK_DIR="$LOCK_ROOT/warmup.lock"
+LAST_ATTEMPT="$RUN_DIR/last-attempt"
+LAST_SUCCESS="$RUN_DIR/last-success"
+LAST_TRIGGER_AT="$RUN_DIR/last-trigger-at"
+LOG_FILE="$CWW_LOG_DIR/warmup.log"
+
+# launchd gives the job a minimal PATH. Claude Code must be reachable because
+# CCLimitPing resolves `claude` through PATH, and the interactive session shells
+# out to standard tools.
+export PATH="$CWW_CLAUDE_PATH_DIR:/usr/bin:/bin:/usr/sbin:/sbin"
+
+# Keeps these tiny automated sessions out of normal Claude Code prompt history.
+export CLAUDE_CODE_SKIP_PROMPT_HISTORY=1
+
+# Environment variables known to redirect Claude Code away from the subscription
+# login. Any of these being set means a request could be billed elsewhere.
+typeset -ga PROVIDER_OVERRIDE_VARS=(
+  ANTHROPIC_API_KEY
+  ANTHROPIC_AUTH_TOKEN
+  ANTHROPIC_BASE_URL
+  ANTHROPIC_CUSTOM_HEADERS
+  ANTHROPIC_IDENTITY_TOKEN
+  ANTHROPIC_IDENTITY_TOKEN_FILE
+  ANTHROPIC_UNIX_SOCKET
+  ANTHROPIC_AWS_API_KEY
+  ANTHROPIC_AWS_BASE_URL
+  ANTHROPIC_AWS_WORKSPACE_ID
+  ANTHROPIC_BEDROCK_BASE_URL
+  ANTHROPIC_BEDROCK_MANTLE_BASE_URL
+  ANTHROPIC_VERTEX_BASE_URL
+  ANTHROPIC_VERTEX_PROJECT_ID
+  ANTHROPIC_FOUNDRY_API_KEY
+  ANTHROPIC_FOUNDRY_AUTH_TOKEN
+  ANTHROPIC_FOUNDRY_BASE_URL
+  ANTHROPIC_FOUNDRY_RESOURCE
+  AWS_BEARER_TOKEN_BEDROCK
+  CLAUDE_CODE_USE_BEDROCK
+  CLAUDE_CODE_USE_VERTEX
+  CLAUDE_CODE_USE_FOUNDRY
+  CLAUDE_CODE_USE_GATEWAY
+  CLAUDE_CODE_USE_MANTLE
+  CLAUDE_CODE_USE_ANTHROPIC_AWS
+  CLAUDE_CODE_SKIP_BEDROCK_AUTH
+  CLAUDE_CODE_SKIP_VERTEX_AUTH
+  CLAUDE_CODE_SKIP_FOUNDRY_AUTH
+  CLAUDE_CODE_SKIP_MANTLE_AUTH
+  CLAUDE_CODE_SKIP_ANTHROPIC_AWS_AUTH
+)
+
+# --- Logging ----------------------------------------------------------------
+
+rotate_logs() {
+  [[ -f $LOG_FILE ]] || return 0
+  local size
+  size=$(/usr/bin/stat -f%z "$LOG_FILE" 2>/dev/null) || return 0
+  (( size < LOG_MAX_BYTES )) && return 0
+  local i
+  /bin/rm -f -- "$LOG_FILE.$LOG_KEEP"
+  for (( i = LOG_KEEP - 1; i >= 1; i-- )); do
+    [[ -f $LOG_FILE.$i ]] && /bin/mv -f -- "$LOG_FILE.$i" "$LOG_FILE.$((i + 1))"
+  done
+  /bin/mv -f -- "$LOG_FILE" "$LOG_FILE.1"
+  return 0
+}
+
+# launchd holds its stdout/stderr files open in append mode, so renaming them
+# would strand the descriptor. Truncating in place keeps them bounded.
+cap_launchd_logs() {
+  local f size
+  for f in "$CWW_LOG_DIR/launchd.stdout.log" "$CWW_LOG_DIR/launchd.stderr.log"; do
+    [[ -f $f ]] || continue
+    size=$(/usr/bin/stat -f%z "$f" 2>/dev/null) || continue
+    (( size >= LOG_MAX_BYTES )) && : > "$f"
+  done
+  return 0
+}
+
+log() {
+  local line
+  line="$(/bin/date '+%Y-%m-%dT%H:%M:%S%z') $*"
+  print -r -- "$line" >> "$LOG_FILE"
+  [[ -t 1 ]] && print -r -- "$line"
+  return 0
+}
+
+# Strips ANSI escapes and control bytes, collapses newlines and truncates, so a
+# subprocess can never inject junk (or a long secret-looking blob) into the log.
+sanitize() {
+  LC_ALL=C /usr/bin/sed $'s/\033\\[[0-9;?]*[a-zA-Z]//g' \
+    | LC_ALL=C /usr/bin/tr -d '\000-\010\013\014\016-\037\177' \
+    | LC_ALL=C /usr/bin/tr '\n' '|' \
+    | /usr/bin/cut -c1-400
+}
+
+# --- Lock -------------------------------------------------------------------
+
+LOCK_HELD=0
+
+cleanup() {
+  local rc=$?
+  if (( LOCK_HELD )); then
+    /bin/rm -rf -- "$LOCK_DIR"
+    LOCK_HELD=0
+  fi
+  return $rc
+}
+
+acquire_lock() {
+  if /bin/mkdir "$LOCK_DIR" 2>/dev/null; then
+    LOCK_HELD=1
+    print -r -- $$ > "$LOCK_DIR/pid"
+    return 0
+  fi
+  local owner=""
+  [[ -f $LOCK_DIR/pid ]] && owner=$(< "$LOCK_DIR/pid")
+  if [[ -n $owner ]] && kill -0 "$owner" 2>/dev/null; then
+    return 1
+  fi
+  log "WARN  stale lock reclaimed (owner pid '${owner:-unknown}' is not running)"
+  /bin/rm -rf -- "$LOCK_DIR"
+  if /bin/mkdir "$LOCK_DIR" 2>/dev/null; then
+    LOCK_HELD=1
+    print -r -- $$ > "$LOCK_DIR/pid"
+    return 0
+  fi
+  return 1
+}
+
+# --- Helpers ----------------------------------------------------------------
+
+now_epoch() { /bin/date '+%s'; }
+
+read_stamp() {
+  local f="$1" v=""
+  [[ -f $f ]] || { print -r -- 0; return 0 }
+  v=$(< "$f")
+  v=${v%% *}
+  [[ $v == <-> ]] || v=0
+  print -r -- "$v"
+}
+
+write_stamp() {
+  local f="$1" e
+  e=$(now_epoch)
+  print -r -- "$e $(/bin/date -r "$e" '+%Y-%m-%dT%H:%M:%S%z')" > "$f"
+}
+
+json_get() { /usr/bin/plutil -extract "$2" raw -o - -- "$1" 2>/dev/null; }
+
+iso_to_epoch() {
+  local s="$1" base tz
+  [[ -n $s ]] || return 1
+  if [[ $s == *Z ]]; then
+    base=${s%Z}
+    base=${base%%.*}
+    TZ=UTC /bin/date -j -f '%Y-%m-%dT%H:%M:%S' "$base" '+%s' 2>/dev/null
+    return
+  fi
+  if [[ $s =~ '^(.*)([+-][0-9][0-9]):([0-9][0-9])$' ]]; then
+    base=${match[1]%%.*}
+    tz="${match[2]}${match[3]}"
+    /bin/date -j -f '%Y-%m-%dT%H:%M:%S%z' "${base}${tz}" '+%s' 2>/dev/null
+    return
+  fi
+  return 1
+}
+
+# Returns 0 if $1 >= $2, comparing as decimals.
+ge_num() { /usr/bin/awk -v a="$1" -v b="$2" 'BEGIN { exit !(a + 0 >= b + 0) }'; }
+
+is_num() { [[ $1 =~ '^[0-9]+([.][0-9]+)?$' ]]; }
+
+fmt_pct() { /usr/bin/awk -v v="$1" 'BEGIN { printf "%.1f", v + 0 }'; }
+
+# Kills a process and everything below it, deepest first, so a hung interactive
+# PTY session cannot leave an orphaned `claude` behind.
+kill_tree() {
+  local sig="$1" pid="$2" child
+  for child in ${(f)"$(/usr/bin/pgrep -P "$pid" 2>/dev/null)"}; do
+    [[ -n $child ]] && kill_tree "$sig" "$child"
+  done
+  kill "-$sig" "$pid" 2>/dev/null || true
+  return 0
+}
+
+# run_with_timeout SECONDS OUTFILE CMD...
+# Completion is signalled through a sentinel file rather than `kill -0`, which
+# also succeeds for an unreaped zombie. Returns 124 on timeout.
+run_with_timeout() {
+  local secs="$1" outfile="$2"; shift 2
+  local rcfile="$outfile.rc" pid waited=0 rc
+  /bin/rm -f -- "$rcfile"
+  { set +e; "$@" > "$outfile" 2>&1; print -r -- $? > "$rcfile"; } &
+  pid=$!
+  while [[ ! -f $rcfile ]]; do
+    if (( waited >= secs )); then
+      kill_tree TERM "$pid"
+      sleep 3
+      kill_tree KILL "$pid"
+      wait "$pid" 2>/dev/null || true
+      return 124
+    fi
+    sleep 1
+    (( waited += 1 ))
+  done
+  wait "$pid" 2>/dev/null || true
+  rc=$(< "$rcfile")
+  [[ $rc == <-> ]] || rc=1
+  return $rc
+}
+
+# --- Step 2: lid state ------------------------------------------------------
+
+lid_state() {
+  if [[ ${CLAUDE_WARMUP_TEST_MODE:-0} == 1 && -n ${CLAUDE_WARMUP_TEST_LID_STATE:-} ]]; then
+    print -r -- "$CLAUDE_WARMUP_TEST_LID_STATE"
+    return 0
+  fi
+  local out=""
+  out=$(/usr/sbin/ioreg -r -k AppleClamshellState 2>/dev/null) || out=""
+  if [[ $out != *'"AppleClamshellState"'* ]]; then
+    print -r -- absent
+    return 0
+  fi
+  if [[ $out == *'"AppleClamshellState" = Yes'* ]]; then
+    print -r -- closed
+  else
+    print -r -- open
+  fi
+}
+
+# --- Step 3: guards ---------------------------------------------------------
+
+check_binaries() {
+  if [[ ! -x $LIMITPING_BIN ]]; then
+    log "FAIL  authentication error: limitping is missing or not executable at $LIMITPING_BIN"
+    return 1
+  fi
+  if [[ ! -x $CWW_CLAUDE_BIN ]]; then
+    log "FAIL  authentication error: claude is missing or not executable at $CWW_CLAUDE_BIN"
+    return 1
+  fi
+  return 0
+}
+
+check_provider_overrides() {
+  local v
+  local -a hits
+  hits=()
+  for v in $PROVIDER_OVERRIDE_VARS; do
+    if [[ -n ${(P)v:-} ]]; then
+      hits+=("$v")
+    fi
+  done
+  if (( ${#hits} )); then
+    # Only the variable names are logged; values may be credentials.
+    log "FAIL  authentication error: non-subscription provider override active (${(j:, :)hits})"
+    return 1
+  fi
+  local f helper
+  for f in "$CWW_USER_HOME/.claude/settings.json" "$CWW_USER_HOME/.claude/settings.local.json"; do
+    [[ -f $f ]] || continue
+    if helper=$(json_get "$f" apiKeyHelper) && [[ -n $helper ]]; then
+      log "FAIL  authentication error: apiKeyHelper configured in $f"
+      return 1
+    fi
+  done
+  return 0
+}
+
+check_auth() {
+  local tmp="$1/auth.json" rc=0
+  run_with_timeout 30 "$tmp" "$CWW_CLAUDE_BIN" auth status --json || rc=$?
+  if (( rc != 0 )); then
+    log "FAIL  authentication error: 'claude auth status' exited $rc"
+    return 1
+  fi
+  local logged_in auth_method api_provider subscription key_source
+  logged_in=$(json_get "$tmp" loggedIn) || logged_in=""
+  auth_method=$(json_get "$tmp" authMethod) || auth_method=""
+  api_provider=$(json_get "$tmp" apiProvider) || api_provider=""
+  subscription=$(json_get "$tmp" subscriptionType) || subscription=""
+  key_source=$(json_get "$tmp" apiKeySource) || key_source=""
+
+  if [[ $logged_in != true ]]; then
+    log "FAIL  authentication error: not logged in to Claude Code"
+    return 1
+  fi
+  if [[ -n $key_source ]]; then
+    log "FAIL  authentication error: API key in use (source $key_source); refusing to send an API-billed request"
+    return 1
+  fi
+  if [[ $api_provider != firstParty ]]; then
+    log "FAIL  authentication error: apiProvider is '${api_provider:-unknown}', not the first-party subscription"
+    return 1
+  fi
+  if [[ $auth_method != claude.ai ]]; then
+    log "FAIL  authentication error: authMethod is '${auth_method:-unknown}', not a claude.ai subscription login"
+    return 1
+  fi
+  if [[ -z $subscription ]]; then
+    log "FAIL  authentication error: no subscription attached to the current login"
+    return 1
+  fi
+  log "INFO  auth ok (method=$auth_method provider=$api_provider subscription=$subscription)"
+  return 0
+}
+
+# --- Step 5/7: usage status -------------------------------------------------
+
+# Populates CLAUDE_FIVE_ACTIVE / CLAUDE_FIVE_RESETS / CLAUDE_FIVE_REMAINING /
+# CLAUDE_FIVE_USED / CLAUDE_WEEKLY_USED / CLAUDE_WEEKLY_RESETS.
+read_claude_status() {
+  local tmp="$1" rc=0
+  run_with_timeout "$STATUS_TIMEOUT" "$tmp" \
+    /usr/bin/env "XDG_CONFIG_HOME=$CONFIG_HOME" "$LIMITPING_BIN" status --json || rc=$?
+  if (( rc == 124 )); then
+    log "FAIL  status endpoint error: timeout after ${STATUS_TIMEOUT}s"
+    return 1
+  fi
+
+  local idx="" i provider
+  for i in 0 1 2 3 4; do
+    provider=$(json_get "$tmp" "$i.provider") || continue
+    if [[ $provider == claude ]]; then
+      idx=$i
+      break
+    fi
+  done
+  if [[ -z $idx ]]; then
+    log "FAIL  status endpoint error: no claude entry in status output (exit $rc): $(sanitize < "$tmp")"
+    return 1
+  fi
+
+  local err
+  if err=$(json_get "$tmp" "$idx.error") && [[ -n $err ]]; then
+    log "FAIL  status endpoint error: $(print -r -- "$err" | sanitize)"
+    return 1
+  fi
+  if (( rc != 0 )); then
+    log "FAIL  status endpoint error: limitping status exited $rc"
+    return 1
+  fi
+
+  CLAUDE_FIVE_ACTIVE=$(json_get "$tmp" "$idx.five_hour.active") || CLAUDE_FIVE_ACTIVE=""
+  CLAUDE_FIVE_RESETS=$(json_get "$tmp" "$idx.five_hour.resets_at") || CLAUDE_FIVE_RESETS=""
+  CLAUDE_FIVE_REMAINING=$(json_get "$tmp" "$idx.five_hour.remaining_seconds") || CLAUDE_FIVE_REMAINING=""
+  CLAUDE_FIVE_USED=$(json_get "$tmp" "$idx.five_hour.used_percent") || CLAUDE_FIVE_USED=""
+  CLAUDE_WEEKLY_USED=$(json_get "$tmp" "$idx.weekly.used_percent") || CLAUDE_WEEKLY_USED=""
+  CLAUDE_WEEKLY_RESETS=$(json_get "$tmp" "$idx.weekly.resets_at") || CLAUDE_WEEKLY_RESETS=""
+
+  if [[ $CLAUDE_FIVE_ACTIVE != true && $CLAUDE_FIVE_ACTIVE != false ]]; then
+    log "FAIL  status endpoint error: five_hour window missing or unparseable"
+    return 1
+  fi
+  if [[ -z $CLAUDE_FIVE_REMAINING ]]; then
+    log "FAIL  status endpoint error: five_hour.remaining_seconds missing"
+    return 1
+  fi
+  if ! is_num "$CLAUDE_FIVE_REMAINING" || ! is_num "$CLAUDE_FIVE_USED"; then
+    log "FAIL  status endpoint error: five_hour usage fields missing or unparseable"
+    return 1
+  fi
+  if ! is_num "$CLAUDE_WEEKLY_USED"; then
+    log "FAIL  status endpoint error: weekly.used_percent missing or unparseable"
+    return 1
+  fi
+  if [[ -n $CLAUDE_FIVE_RESETS ]] && ! iso_to_epoch "$CLAUDE_FIVE_RESETS" >/dev/null; then
+    log "FAIL  status endpoint error: five_hour.resets_at is unparseable"
+    return 1
+  fi
+  return 0
+}
+
+# --- Main -------------------------------------------------------------------
+
+main() {
+  /bin/mkdir -p -- "$CWW_LOG_DIR" "$RUN_DIR" "$WORK_DIR" "$LOCK_ROOT"
+  rotate_logs
+  cap_launchd_logs
+
+  trap cleanup EXIT INT TERM
+
+  if ! acquire_lock; then
+    log "SKIP  Skipped: another check is running"
+    return 0
+  fi
+
+  log "INFO  check started (pid $$)"
+
+  local lid
+  lid=$(lid_state)
+  if [[ $lid == closed ]]; then
+    log "SKIP  Skipped: MacBook lid is closed"
+    return 0
+  fi
+  if [[ $lid == absent ]]; then
+    log "INFO  lid state: AppleClamshellState absent, treating as desktop"
+  else
+    log "INFO  lid state: open"
+  fi
+
+  local tmpdir
+  tmpdir=$(/usr/bin/mktemp -d "${TMPDIR:-/tmp}/claude-warmup.XXXXXX")
+  trap "cleanup; /bin/rm -rf -- '$tmpdir'" EXIT INT TERM
+
+  check_binaries || return 3
+  check_provider_overrides || return 3
+  check_auth "$tmpdir" || return 3
+
+  local now attempt success trigger_at remaining
+  now=$(now_epoch)
+  attempt=$(read_stamp "$LAST_ATTEMPT")
+  success=$(read_stamp "$LAST_SUCCESS")
+  if (( attempt > success )); then
+    remaining=$(( FAILURE_COOLDOWN - (now - attempt) ))
+    if (( remaining > 0 )); then
+      log "SKIP  skipped: failure cooldown (${remaining}s remaining after a failed attempt)"
+      return 0
+    fi
+  fi
+
+  local CLAUDE_FIVE_ACTIVE CLAUDE_FIVE_RESETS CLAUDE_FIVE_REMAINING CLAUDE_FIVE_USED
+  local CLAUDE_WEEKLY_USED CLAUDE_WEEKLY_RESETS
+  if ! read_claude_status "$tmpdir/status1.json"; then
+    write_stamp "$LAST_ATTEMPT"
+    return 4
+  fi
+
+  log "INFO  usage: 5h active=$CLAUDE_FIVE_ACTIVE used=$(fmt_pct "$CLAUDE_FIVE_USED")% resets_at=${CLAUDE_FIVE_RESETS:-none} | weekly used=$(fmt_pct "$CLAUDE_WEEKLY_USED")%"
+
+  if ge_num "${CLAUDE_WEEKLY_USED:-0}" "$WEEKLY_THRESHOLD_PCT"; then
+    log "SKIP  skipped: weekly threshold reached ($(fmt_pct "$CLAUDE_WEEKLY_USED")% >= ${WEEKLY_THRESHOLD_PCT}%), weekly resets at ${CLAUDE_WEEKLY_RESETS:-unknown}"
+    return 0
+  fi
+
+  # A window is running whenever the API reports a five-hour reset time that is
+  # still in the future. Utilization is deliberately NOT used: a minimal Haiku
+  # warm-up costs so little that used_percent stays 0.0, which would make
+  # limitping's own `active` flag report false for a window this job just
+  # started and cause a fresh ping every five minutes.
+  local reset_epoch=""
+  reset_epoch=$(iso_to_epoch "${CLAUDE_FIVE_RESETS:-}") || reset_epoch=""
+  now=$(now_epoch)
+  if [[ -n $reset_epoch ]]; then
+    if (( now < reset_epoch )); then
+      log "SKIP  skipped: window active until $CLAUDE_FIVE_RESETS ($(( reset_epoch - now ))s remaining)"
+      return 0
+    fi
+    if (( now - reset_epoch < RESET_BUFFER )); then
+      log "SKIP  skipped: reset buffer ($(( RESET_BUFFER - (now - reset_epoch) ))s until the window is safely rolled over)"
+      return 0
+    fi
+  fi
+
+  # A successful PTY invocation may have started the window even when the
+  # unofficial usage endpoint is stale or unavailable during verification.
+  # Keep status as the normal scheduler, but impose this local duplicate-request
+  # safety floor before authorizing another real ping.
+  trigger_at=$(read_stamp "$LAST_TRIGGER_AT")
+  if (( trigger_at > 0 )); then
+    remaining=$(( TRIGGER_SAFETY_FLOOR - (now - trigger_at) ))
+    if (( remaining > 0 )); then
+      log "SKIP  skipped: recent successful trigger safety floor (${remaining}s remaining)"
+      return 0
+    fi
+  fi
+
+  write_stamp "$LAST_ATTEMPT"
+  log "INFO  trigger started (limitping ping claude, timeout ${PING_TIMEOUT}s)"
+
+  local rc=0
+  run_with_timeout "$PING_TIMEOUT" "$tmpdir/ping.out" \
+    /usr/bin/env "XDG_CONFIG_HOME=$CONFIG_HOME" "CLAUDE_CODE_SKIP_PROMPT_HISTORY=1" \
+    /bin/sh -c 'cd "$1" && exec "$2" ping claude' _ "$WORK_DIR" "$LIMITPING_BIN" || rc=$?
+
+  if (( rc == 124 )); then
+    log "FAIL  timeout: interactive trigger exceeded ${PING_TIMEOUT}s and was killed"
+    return 7
+  fi
+  if (( rc != 0 )); then
+    log "FAIL  trigger failed (exit $rc): $(sanitize < "$tmpdir/ping.out")"
+    return 5
+  fi
+  write_stamp "$LAST_TRIGGER_AT"
+  log "INFO  trigger completed: $(sanitize < "$tmpdir/ping.out")"
+
+  # The usage endpoint lags a freshly anchored window by tens of seconds, so
+  # poll rather than judge on a single read.
+  local attempt_n=1 verified=0 window_remaining=0
+  while (( attempt_n <= VERIFY_ATTEMPTS )); do
+    sleep "$VERIFY_DELAY"
+    if ! read_claude_status "$tmpdir/status.verify$attempt_n.json"; then
+      log "WARN  verification attempt $attempt_n/$VERIFY_ATTEMPTS: usage status unreadable"
+    else
+      reset_epoch=$(iso_to_epoch "${CLAUDE_FIVE_RESETS:-}") || reset_epoch=""
+      now=$(now_epoch)
+      if [[ -n $reset_epoch ]] && (( reset_epoch > now )); then
+        window_remaining=$(( reset_epoch - now ))
+        verified=1
+        break
+      fi
+      log "WARN  verification attempt $attempt_n/$VERIFY_ATTEMPTS: 5h window not anchored yet (resets_at=${CLAUDE_FIVE_RESETS:-none})"
+    fi
+    (( attempt_n += 1 ))
+  done
+
+  if (( ! verified )); then
+    log "FAIL  verification failed: 5h window did not become active after a successful trigger"
+    return 6
+  fi
+  if (( window_remaining > WINDOW_MAX_SECONDS )); then
+    log "FAIL  verification failed: implausible reset time (${window_remaining}s remaining, resets_at $CLAUDE_FIVE_RESETS)"
+    return 6
+  fi
+  if (( window_remaining < WINDOW_WARN_SECONDS )); then
+    log "WARN  window is active but resets in only ${window_remaining}s ($CLAUDE_FIVE_RESETS); it may have been started before this run"
+  fi
+
+  write_stamp "$LAST_SUCCESS"
+  log "OK    verification succeeded: 5h window active until $CLAUDE_FIVE_RESETS (${window_remaining}s remaining, used $(fmt_pct "$CLAUDE_FIVE_USED")%)"
+  return 0
+}
+
+main "$@"

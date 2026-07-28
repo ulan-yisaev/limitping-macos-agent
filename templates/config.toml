@@ -1,0 +1,26 @@
+# Private limitping configuration for the ClaudeWindowWarmup automation.
+# Reached only via XDG_CONFIG_HOME=<...>/ClaudeWindowWarmup/config, so it never
+# interferes with a user-level ~/.config/limitping installation.
+
+weekly_threshold = 0.99
+reset_buffer = "10s"
+notify = false
+usage_display = "used"
+
+[claude]
+enabled = true
+prompt = "."
+model = "haiku"
+extra_args = [
+  "--safe-mode",
+  "--tools", "",
+  "--strict-mcp-config",
+  "--system-prompt", "Reply only with OK.",
+  "--no-chrome"
+]
+
+[codex]
+enabled = false
+
+[spark]
+enabled = false

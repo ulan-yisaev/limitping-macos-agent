@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: false
+
+      - name: Syntax and templates
+        run: make lint
+
+      - name: Wrapper tests
+        run: make test
+
+      - name: Privacy and secret audit
+        run: make audit
+
+      - name: Pinned dependency and dry-run
+        run: make dependency-test
