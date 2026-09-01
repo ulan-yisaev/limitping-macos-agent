@@ -41,6 +41,16 @@ WINDOW_WARN_SECONDS=14400 # below this, a fresh window looks unexpectedly short
 LOG_MAX_BYTES=2097152   # rotate warmup.log at 2 MiB
 LOG_KEEP=5              # historical logs retained
 
+# Optional Wednesday alignment is injected by the installer. In this mode,
+# other days retain the normal continuous policy, while Wednesday permits new
+# windows only near 07:00 and 12:05 local time. The latter normally expires at
+# 17:05, five minutes after a 17:00 weekly reset.
+ALIGNMENT_ENABLED='@CWW_ALIGNMENT_ENABLED@'
+ALIGNMENT_WEEKDAY=3 # ISO weekday: Monday=1, Wednesday=3
+ALIGNMENT_SLOTS='25200,43500' # seconds after midnight: 07:00, 12:05
+ALIGNMENT_GRACE_SECONDS=900
+ALIGNMENT_ALLOW_CLOSED_LID_ON_AC='@CWW_ALIGNMENT_ALLOW_CLOSED_LID_ON_AC@'
+
 # The test-only overrides below are never set by the production plist. They
 # exist so the wrapper can be exercised against fake claude/limitping binaries.
 if [[ ${CLAUDE_WARMUP_TEST_MODE:-0} == 1 ]]; then
@@ -55,6 +65,10 @@ if [[ ${CLAUDE_WARMUP_TEST_MODE:-0} == 1 ]]; then
   VERIFY_DELAY=${CLAUDE_WARMUP_TEST_VERIFY_DELAY:-$VERIFY_DELAY}
   VERIFY_ATTEMPTS=${CLAUDE_WARMUP_TEST_VERIFY_ATTEMPTS:-$VERIFY_ATTEMPTS}
   LOG_MAX_BYTES=${CLAUDE_WARMUP_TEST_LOG_MAX_BYTES:-$LOG_MAX_BYTES}
+  # Tests default to the baseline profile even when exercising an installed
+  # wrapper that has alignment embedded. Alignment cases opt in explicitly.
+  ALIGNMENT_ENABLED=${CLAUDE_WARMUP_TEST_ALIGNMENT_ENABLED:-0}
+  ALIGNMENT_ALLOW_CLOSED_LID_ON_AC=${CLAUDE_WARMUP_TEST_ALLOW_CLOSED_LID_ON_AC:-0}
 fi
 
 LIMITPING_BIN="$CWW_ROOT/bin/limitping"
@@ -235,6 +249,53 @@ ge_num() { /usr/bin/awk -v a="$1" -v b="$2" 'BEGIN { exit !(a + 0 >= b + 0) }'; 
 is_num() { [[ $1 =~ '^[0-9]+([.][0-9]+)?$' ]]; }
 
 fmt_pct() { /usr/bin/awk -v v="$1" 'BEGIN { printf "%.1f", v + 0 }'; }
+
+weekday_now() {
+  if [[ ${CLAUDE_WARMUP_TEST_MODE:-0} == 1 && -n ${CLAUDE_WARMUP_TEST_WEEKDAY:-} ]]; then
+    print -r -- "$CLAUDE_WARMUP_TEST_WEEKDAY"
+  else
+    /bin/date '+%u'
+  fi
+}
+
+seconds_since_midnight() {
+  if [[ ${CLAUDE_WARMUP_TEST_MODE:-0} == 1 && -n ${CLAUDE_WARMUP_TEST_SECONDS_SINCE_MIDNIGHT:-} ]]; then
+    print -r -- "$CLAUDE_WARMUP_TEST_SECONDS_SINCE_MIDNIGHT"
+    return 0
+  fi
+  local h m s
+  h=$(/bin/date '+%H')
+  m=$(/bin/date '+%M')
+  s=$(/bin/date '+%S')
+  print -r -- $(( 10#$h * 3600 + 10#$m * 60 + 10#$s ))
+}
+
+# Prints unrestricted, allowed, or blocked. Alignment restricts only the reset
+# day; normal continuous warming remains in effect on the other six days.
+alignment_policy() {
+  [[ $ALIGNMENT_ENABLED == 1 ]] || { print -r -- unrestricted; return 0 }
+  local weekday now_s slot
+  weekday=$(weekday_now)
+  [[ $weekday == $ALIGNMENT_WEEKDAY ]] \
+    || { print -r -- unrestricted; return 0 }
+  now_s=$(seconds_since_midnight)
+  for slot in ${(s:,:)ALIGNMENT_SLOTS}; do
+    [[ $slot == <-> ]] || continue
+    if (( now_s >= slot && now_s < slot + ALIGNMENT_GRACE_SECONDS )); then
+      print -r -- allowed
+      return 0
+    fi
+  done
+  print -r -- blocked
+}
+
+on_ac_power() {
+  if [[ ${CLAUDE_WARMUP_TEST_MODE:-0} == 1 && -n ${CLAUDE_WARMUP_TEST_POWER_SOURCE:-} ]]; then
+    [[ $CLAUDE_WARMUP_TEST_POWER_SOURCE == AC ]]
+    return
+  fi
+  /usr/bin/pmset -g batt 2>/dev/null | /usr/bin/head -n 1 | /usr/bin/grep -q "'AC Power'"
+}
 
 # Kills a process and everything below it, deepest first, so a hung interactive
 # PTY session cannot leave an orphaned `claude` behind.
@@ -452,11 +513,21 @@ main() {
 
   log "INFO  check started (pid $$)"
 
-  local lid
+  local lid alignment
+  alignment=$(alignment_policy)
   lid=$(lid_state)
   if [[ $lid == closed ]]; then
-    log "SKIP  Skipped: MacBook lid is closed"
-    return 0
+    if [[ $alignment == allowed && $ALIGNMENT_ALLOW_CLOSED_LID_ON_AC == 1 ]]; then
+      if on_ac_power; then
+        log "INFO  lid state: closed; Wednesday alignment permits this AC-powered scheduled slot"
+      else
+        log "SKIP  Skipped: scheduled closed-lid warm-up requires AC power"
+        return 0
+      fi
+    else
+      log "SKIP  Skipped: MacBook lid is closed"
+      return 0
+    fi
   fi
   if [[ $lid == absent ]]; then
     log "INFO  lid state: AppleClamshellState absent, treating as desktop"
@@ -514,6 +585,11 @@ main() {
       log "SKIP  skipped: reset buffer ($(( RESET_BUFFER - (now - reset_epoch) ))s until the window is safely rolled over)"
       return 0
     fi
+  fi
+
+  if [[ $alignment == blocked ]]; then
+    log "SKIP  skipped: Wednesday alignment allows new windows only near 07:00 and 12:05 local time"
+    return 0
   fi
 
   if ge_num "${CLAUDE_WEEKLY_USED:-0}" "$WEEKLY_THRESHOLD_PCT"; then

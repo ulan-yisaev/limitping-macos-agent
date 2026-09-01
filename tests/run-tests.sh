@@ -311,6 +311,67 @@ expect_pings 1
 expect_log "delayed verification reconciled"
 expect_file "$ROOT/run/last-success"
 
+# --- 7b. Wednesday reset alignment -----------------------------------------
+
+start_case "07b Wednesday before first slot"
+LID=open run \
+  "CLAUDE_WARMUP_TEST_ALIGNMENT_ENABLED=1" \
+  "CLAUDE_WARMUP_TEST_WEEKDAY=3" \
+  "CLAUDE_WARMUP_TEST_SECONDS_SINCE_MIDNIGHT=23400"
+expect_rc 0
+expect_pings 0
+expect_log "Wednesday alignment allows new windows only"
+
+start_case "07c Wednesday first slot"
+LID=open run \
+  "CLAUDE_WARMUP_TEST_ALIGNMENT_ENABLED=1" \
+  "CLAUDE_WARMUP_TEST_WEEKDAY=3" \
+  "CLAUDE_WARMUP_TEST_SECONDS_SINCE_MIDNIGHT=25200"
+expect_rc 0
+expect_pings 1
+expect_log "verification succeeded"
+
+start_case "07d Wednesday closed lid on AC"
+LID=closed run \
+  "CLAUDE_WARMUP_TEST_ALIGNMENT_ENABLED=1" \
+  "CLAUDE_WARMUP_TEST_ALLOW_CLOSED_LID_ON_AC=1" \
+  "CLAUDE_WARMUP_TEST_WEEKDAY=3" \
+  "CLAUDE_WARMUP_TEST_SECONDS_SINCE_MIDNIGHT=43500" \
+  "CLAUDE_WARMUP_TEST_POWER_SOURCE=AC"
+expect_rc 0
+expect_pings 1
+expect_log "closed; Wednesday alignment permits this AC-powered scheduled slot"
+
+start_case "07e Wednesday closed lid on battery"
+LID=closed run \
+  "CLAUDE_WARMUP_TEST_ALIGNMENT_ENABLED=1" \
+  "CLAUDE_WARMUP_TEST_ALLOW_CLOSED_LID_ON_AC=1" \
+  "CLAUDE_WARMUP_TEST_WEEKDAY=3" \
+  "CLAUDE_WARMUP_TEST_SECONDS_SINCE_MIDNIGHT=43500" \
+  "CLAUDE_WARMUP_TEST_POWER_SOURCE=Battery"
+expect_rc 0
+expect_statuses 0
+expect_pings 0
+expect_log "requires AC power"
+
+start_case "07f Wednesday after final slot"
+LID=open run \
+  "CLAUDE_WARMUP_TEST_ALIGNMENT_ENABLED=1" \
+  "CLAUDE_WARMUP_TEST_WEEKDAY=3" \
+  "CLAUDE_WARMUP_TEST_SECONDS_SINCE_MIDNIGHT=61500"
+expect_rc 0
+expect_pings 0
+expect_log "Wednesday alignment allows new windows only"
+
+start_case "07g other weekdays stay unrestricted"
+LID=open run \
+  "CLAUDE_WARMUP_TEST_ALIGNMENT_ENABLED=1" \
+  "CLAUDE_WARMUP_TEST_WEEKDAY=2" \
+  "CLAUDE_WARMUP_TEST_SECONDS_SINCE_MIDNIGHT=23400"
+expect_rc 0
+expect_pings 1
+expect_log "verification succeeded"
+
 # --- 8. concurrency ---------------------------------------------------------
 
 start_case "08 concurrent executions"

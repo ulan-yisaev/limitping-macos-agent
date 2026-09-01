@@ -4,8 +4,9 @@
 
 The automation is designed to avoid:
 
-- requests while a MacBook lid is closed;
-- intentionally waking or holding the Mac awake;
+- requests while a MacBook lid is closed, except for the explicit AC-only
+  Wednesday alignment slots;
+- unintentionally waking or holding the Mac awake;
 - API-key or cloud-provider billing;
 - duplicate real requests after ambiguous verification;
 - loading project instructions, tools, MCP servers, or browser integration;
@@ -41,6 +42,11 @@ unsupported device.
 No claim is made that a shell process already running at the exact instant the
 lid closes can be synchronously revoked. The lid is checked before any
 authentication, status, or trigger command.
+
+The optional Wednesday alignment profile narrows the closed-lid exception to
+07:00 and 12:05 local time (with a short recovery grace period) and requires AC
+power. A root-owned helper manages power events only; it never invokes Claude,
+reads user credentials, or writes the user LaunchAgent's state.
 
 ## Request boundary
 

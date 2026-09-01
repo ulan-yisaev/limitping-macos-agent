@@ -8,7 +8,9 @@ cd "$REPO_DIR"
 
 typeset -a files
 if [[ -d .git ]]; then
-  files=(${(f)"$(git ls-files)"})
+  # Include publication candidates that have not been committed yet, otherwise
+  # a newly added file could bypass the local pre-publication audit.
+  files=(${(f)"$(git ls-files --cached --others --exclude-standard)"})
 else
   files=(${(f)"$(/usr/bin/find . -type f ! -path './.git/*' | /usr/bin/sed 's|^\./||')"})
 fi

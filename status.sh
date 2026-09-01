@@ -37,6 +37,21 @@ print -r -- ""
 print -r -- "Installed files:"
 [[ -x "$ROOT/run/warmup-check.sh" ]] && print -r -- "  wrapper: installed" || print -r -- "  wrapper: missing"
 [[ -x "$ROOT/bin/limitping" ]] && print -r -- "  limitping: installed" || print -r -- "  limitping: missing"
+if [[ -f "$ROOT/run/warmup-check.sh" ]] \
+  && /usr/bin/grep -q "^ALIGNMENT_ENABLED='1'$" "$ROOT/run/warmup-check.sh"; then
+  print -r -- "  Wednesday alignment: enabled (07:00 and 12:05)"
+else
+  print -r -- "  Wednesday alignment: disabled"
+fi
+
+print -r -- ""
+print -r -- "Power schedule:"
+POWER_SCHEDULE=$(/usr/bin/pmset -g sched)
+if [[ -n $POWER_SCHEDULE ]]; then
+  print -r -- "$POWER_SCHEDULE" | /usr/bin/sed 's/^/  /'
+else
+  print -r -- "  no scheduled wake events"
+fi
 
 print -r -- ""
 print -r -- "Recent log:"

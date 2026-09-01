@@ -22,6 +22,8 @@ escape() {
   -e "s|@CWW_CLAUDE_BIN@|$(escape "$CLAUDE_BIN")|g" \
   -e "s|@CWW_CLAUDE_PATH_DIR@|$(escape "${CLAUDE_BIN:h}")|g" \
   -e "s|@CWW_USER_HOME@|$(escape "$TMP_ROOT/Home With Spaces")|g" \
+  -e "s|@CWW_ALIGNMENT_ENABLED@|0|g" \
+  -e "s|@CWW_ALIGNMENT_ALLOW_CLOSED_LID_ON_AC@|0|g" \
   "$REPO_DIR/src/warmup-check.sh.in" > "$TMP_ROOT/warmup-check.sh"
 
 /usr/bin/sed \
@@ -32,6 +34,7 @@ escape() {
 
 /bin/zsh -n "$TMP_ROOT/warmup-check.sh"
 /usr/bin/plutil -lint "$PLIST"
+/usr/bin/plutil -lint "$REPO_DIR/templates/noon-wake-launchdaemon.plist"
 ! /usr/bin/grep -Eq '@(CWW|WARMUP|LAUNCHD)_' "$TMP_ROOT/warmup-check.sh" "$PLIST"
 /usr/bin/grep -qF "$ROOT/run/warmup-check.sh" "$PLIST"
 /usr/bin/grep -qF "CWW_ROOT='$ROOT'" "$TMP_ROOT/warmup-check.sh"

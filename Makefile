@@ -1,8 +1,8 @@
 .PHONY: audit dependency-test lint test verify
 
 lint:
-	/bin/zsh -n install.sh uninstall.sh status.sh src/warmup-check.sh.in src/uninstall.sh.in tests/*.sh scripts/*.sh
-	/usr/bin/plutil -lint templates/launchagent.plist.in
+	/bin/zsh -n install.sh uninstall.sh status.sh src/*.sh src/*.in tests/*.sh scripts/*.sh
+	/usr/bin/plutil -lint templates/*.plist templates/*.plist.in
 
 test:
 	/bin/zsh tests/check-templates.sh

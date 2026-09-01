@@ -5,14 +5,17 @@ set -euo pipefail
 
 REPO_DIR=${0:A:h}
 ENABLE=0
+WEDNESDAY_ALIGNMENT=0
 LABEL='com.local.claude-window-warmup'
 
 usage() {
-  print -r -- "Usage: ./install.sh [--enable]"
+  print -r -- "Usage: ./install.sh [--enable] [--wednesday-alignment]"
   print -r -- ""
   print -r -- "Without --enable, installs and validates the files but leaves the"
   print -r -- "LaunchAgent disabled. --enable explicitly permits RunAtLoad, which"
   print -r -- "may send one minimal Claude request if no five-hour window is active."
+  print -r -- "--wednesday-alignment restricts new Wednesday windows to 07:00 and"
+  print -r -- "12:05 local time. It does not configure system wake events."
 }
 
 die() {
@@ -23,6 +26,7 @@ die() {
 for arg in "$@"; do
   case "$arg" in
     --enable) ENABLE=1 ;;
+    --wednesday-alignment) WEDNESDAY_ALIGNMENT=1 ;;
     -h|--help) usage; exit 0 ;;
     *) usage >&2; die "unknown argument: $arg" ;;
   esac
@@ -161,12 +165,16 @@ sed_escape() {
 }
 
 render_wrapper() {
+  local allow_closed=0
+  (( WEDNESDAY_ALIGNMENT )) && allow_closed=1
   /usr/bin/sed \
     -e "s|@CWW_ROOT@|$(sed_escape "$ROOT")|g" \
     -e "s|@CWW_LOG_DIR@|$(sed_escape "$LOG_DIR")|g" \
     -e "s|@CWW_CLAUDE_BIN@|$(sed_escape "$CLAUDE_BIN")|g" \
     -e "s|@CWW_CLAUDE_PATH_DIR@|$(sed_escape "$CLAUDE_BIN_DIR")|g" \
     -e "s|@CWW_USER_HOME@|$(sed_escape "$USER_HOME")|g" \
+    -e "s|@CWW_ALIGNMENT_ENABLED@|$WEDNESDAY_ALIGNMENT|g" \
+    -e "s|@CWW_ALIGNMENT_ALLOW_CLOSED_LID_ON_AC@|$allow_closed|g" \
     "$REPO_DIR/src/warmup-check.sh.in" > "$TMP_ROOT/warmup-check.sh"
 }
 
@@ -238,6 +246,10 @@ if (( ENABLE )); then
   launchctl bootstrap "gui/$(id -u)" "$PLIST"
   print -r -- "Installed and enabled $LABEL"
   print -r -- "RunAtLoad may send one minimal request when no five-hour window is active."
+  if (( WEDNESDAY_ALIGNMENT )); then
+    print -r -- "Wednesday alignment: 07:00 and 12:05 local trigger slots."
+    print -r -- "Closed-lid scheduled slots require AC power."
+  fi
 else
   launchctl disable "gui/$(id -u)/$LABEL"
   print -r -- "Installed but left disabled."
