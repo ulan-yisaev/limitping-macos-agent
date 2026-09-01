@@ -12,7 +12,7 @@
 #   3  guard failure (auth / provider override / missing binary)
 #   4  usage status could not be read or parsed
 #   5  trigger failed
-#   6  trigger returned 0 but the window did not become active
+#   6  trigger returned 0 but the reported reset time was implausible
 #   7  trigger timed out
 
 emulate -L zsh
@@ -476,27 +476,18 @@ main() {
   now=$(now_epoch)
   attempt=$(read_stamp "$LAST_ATTEMPT")
   success=$(read_stamp "$LAST_SUCCESS")
-  if (( attempt > success )); then
-    remaining=$(( FAILURE_COOLDOWN - (now - attempt) ))
-    if (( remaining > 0 )); then
-      log "SKIP  skipped: failure cooldown (${remaining}s remaining after a failed attempt)"
-      return 0
-    fi
-  fi
+  trigger_at=$(read_stamp "$LAST_TRIGGER_AT")
 
   local CLAUDE_FIVE_ACTIVE CLAUDE_FIVE_RESETS CLAUDE_FIVE_REMAINING CLAUDE_FIVE_USED
   local CLAUDE_WEEKLY_USED CLAUDE_WEEKLY_RESETS
   if ! read_claude_status "$tmpdir/status1.json"; then
-    write_stamp "$LAST_ATTEMPT"
+    # No real request was attempted, so retry status on the next scheduled run
+    # instead of turning a transient endpoint or DNS failure into a 30-minute
+    # blind period.
     return 4
   fi
 
   log "INFO  usage: 5h active=$CLAUDE_FIVE_ACTIVE used=$(fmt_pct "$CLAUDE_FIVE_USED")% resets_at=${CLAUDE_FIVE_RESETS:-none} | weekly used=$(fmt_pct "$CLAUDE_WEEKLY_USED")%"
-
-  if ge_num "${CLAUDE_WEEKLY_USED:-0}" "$WEEKLY_THRESHOLD_PCT"; then
-    log "SKIP  skipped: weekly threshold reached ($(fmt_pct "$CLAUDE_WEEKLY_USED")% >= ${WEEKLY_THRESHOLD_PCT}%), weekly resets at ${CLAUDE_WEEKLY_RESETS:-unknown}"
-    return 0
-  fi
 
   # A window is running whenever the API reports a five-hour reset time that is
   # still in the future. Utilization is deliberately NOT used: a minimal Haiku
@@ -508,6 +499,14 @@ main() {
   now=$(now_epoch)
   if [[ -n $reset_epoch ]]; then
     if (( now < reset_epoch )); then
+      # A successful PTY trigger can be visible in the usage endpoint minutes
+      # after the short in-process verification window. Reconcile that pending
+      # result here so the service heals itself without another model request.
+      if (( trigger_at > success )); then
+        write_stamp "$LAST_SUCCESS"
+        log "OK    delayed verification reconciled: 5h window active until $CLAUDE_FIVE_RESETS ($(( reset_epoch - now ))s remaining, used $(fmt_pct "$CLAUDE_FIVE_USED")%)"
+        return 0
+      fi
       log "SKIP  skipped: window active until $CLAUDE_FIVE_RESETS ($(( reset_epoch - now ))s remaining)"
       return 0
     fi
@@ -517,15 +516,30 @@ main() {
     fi
   fi
 
+  if ge_num "${CLAUDE_WEEKLY_USED:-0}" "$WEEKLY_THRESHOLD_PCT"; then
+    log "SKIP  skipped: weekly threshold reached ($(fmt_pct "$CLAUDE_WEEKLY_USED")% >= ${WEEKLY_THRESHOLD_PCT}%), weekly resets at ${CLAUDE_WEEKLY_RESETS:-unknown}"
+    return 0
+  fi
+
   # A successful PTY invocation may have started the window even when the
   # unofficial usage endpoint is stale or unavailable during verification.
   # Keep status as the normal scheduler, but impose this local duplicate-request
   # safety floor before authorizing another real ping.
-  trigger_at=$(read_stamp "$LAST_TRIGGER_AT")
   if (( trigger_at > 0 )); then
     remaining=$(( TRIGGER_SAFETY_FLOOR - (now - trigger_at) ))
     if (( remaining > 0 )); then
-      log "SKIP  skipped: recent successful trigger safety floor (${remaining}s remaining)"
+      log "SKIP  skipped: successful trigger awaiting or retaining verification (${remaining}s safety floor remaining)"
+      return 0
+    fi
+  fi
+
+  # Only a failed real trigger needs a cooldown. Status endpoint failures are
+  # retried every scheduled run, and successful-but-not-yet-visible triggers are
+  # handled by the stronger five-hour duplicate-request floor above.
+  if (( attempt > success )); then
+    remaining=$(( FAILURE_COOLDOWN - (now - attempt) ))
+    if (( remaining > 0 )); then
+      log "SKIP  skipped: failed-trigger cooldown (${remaining}s remaining)"
       return 0
     fi
   fi
@@ -570,8 +584,8 @@ main() {
   done
 
   if (( ! verified )); then
-    log "FAIL  verification failed: 5h window did not become active after a successful trigger"
-    return 6
+    log "WARN  verification pending: trigger succeeded but the usage endpoint has not exposed the 5h window yet; scheduled checks will reconcile it without another request"
+    return 0
   fi
   if (( window_remaining > WINDOW_MAX_SECONDS )); then
     log "FAIL  verification failed: implausible reset time (${window_remaining}s remaining, resets_at $CLAUDE_FIVE_RESETS)"

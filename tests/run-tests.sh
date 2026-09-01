@@ -256,12 +256,14 @@ LID=open run
 expect_rc 4
 expect_pings 0
 expect_log "status endpoint error"
-expect_file "$ROOT/run/last-attempt"
+expect_nofile "$ROOT/run/last-attempt"
 expect_nofile "$ROOT/run/last-success"
-# second run must be throttled, not retried
+# A transient status failure must be retried on the next scheduled run. It did
+# not send a request, so the failed-trigger cooldown must not apply.
 LID=open run
-expect_rc 0
-expect_log "skipped: failure cooldown"
+expect_rc 4
+expect_statuses 2
+expect_nolog "cooldown"
 expect_pings 0
 
 # --- 6. ping failure then cooldown ------------------------------------------
@@ -274,31 +276,40 @@ expect_log "trigger failed"
 expect_nofile "$ROOT/run/last-success"
 expect_nofile "$ROOT/run/last-trigger-at"
 expect_file "$ROOT/run/last-attempt"
+/bin/rm -f -- "$SBX/status.count"
 LID=open run
 expect_rc 0
-expect_log "skipped: failure cooldown"
+expect_log "skipped: failed-trigger cooldown"
 expect_pings 1
 
-# --- 7. verification failure (trigger exits 0, window stays inactive) -------
+# --- 7. delayed verification self-heals -------------------------------------
 
-start_case "07 verification failure"
+start_case "07 delayed verification"
 mk_status "$SBX/status.2.json" false 0 -600 5
 LID=open run
-expect_rc 6
+expect_rc 0
 expect_pings 1
-expect_log "verification failed"
+expect_log "verification pending"
 expect_nofile "$ROOT/run/last-success"
 expect_file "$ROOT/run/last-trigger-at"
 
-# Age the ordinary failure cooldown beyond 30 minutes while leaving the
-# successful-trigger timestamp recent. Even with stale/inactive usage data, the
-# wrapper must not send a second request during the 5h1m safety floor.
-print -r -- "$(( $(/bin/date '+%s') - 1900 )) aged-for-test" > "$ROOT/run/last-attempt"
+# The next scheduled check still sees stale/inactive data. It must not send a
+# duplicate request and must not mislabel the successful trigger as a failure.
 /bin/rm -f -- "$SBX/status.count"
 LID=open run
 expect_rc 0
 expect_pings 1
-expect_log "recent successful trigger safety floor"
+expect_log "successful trigger awaiting or retaining verification"
+
+# Once the endpoint catches up, the next scheduled check records success
+# without issuing another model request.
+mk_status "$SBX/status.1.json" false 0 17400 5
+/bin/rm -f -- "$SBX/status.count"
+LID=open run
+expect_rc 0
+expect_pings 1
+expect_log "delayed verification reconciled"
+expect_file "$ROOT/run/last-success"
 
 # --- 8. concurrency ---------------------------------------------------------
 

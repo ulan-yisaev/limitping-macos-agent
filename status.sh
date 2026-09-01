@@ -14,9 +14,24 @@ ROOT="$USER_HOME/Library/Application Support/ClaudeWindowWarmup"
 LOG="$USER_HOME/Library/Logs/ClaudeWindowWarmup/warmup.log"
 
 print -r -- "LaunchAgent:"
-launchctl print "gui/$(id -u)/$LABEL" 2>&1 \
-  | /usr/bin/grep -E 'state =|runs =|last exit code|run interval' \
-  || print -r -- "  not loaded"
+LAUNCH_STATE=$(launchctl print "gui/$(id -u)/$LABEL" 2>&1) || LAUNCH_STATE=""
+if [[ -z $LAUNCH_STATE ]]; then
+  print -r -- "  loaded: no"
+else
+  JOB_STATE=$(print -r -- "$LAUNCH_STATE" | /usr/bin/sed -n 's/^[[:space:]]*state = //p' | /usr/bin/head -n 1)
+  RUNS=$(print -r -- "$LAUNCH_STATE" | /usr/bin/sed -n 's/^[[:space:]]*runs = //p' | /usr/bin/head -n 1)
+  LAST_EXIT=$(print -r -- "$LAUNCH_STATE" | /usr/bin/sed -n 's/^[[:space:]]*last exit code = //p' | /usr/bin/head -n 1)
+  INTERVAL=$(print -r -- "$LAUNCH_STATE" | /usr/bin/sed -n 's/^[[:space:]]*run interval = //p' | /usr/bin/head -n 1)
+  print -r -- "  loaded: yes"
+  if [[ $JOB_STATE == "not running" ]]; then
+    print -r -- "  state: idle (normal between scheduled checks)"
+  else
+    print -r -- "  state: ${JOB_STATE:-unknown}"
+  fi
+  print -r -- "  runs this login: ${RUNS:-unknown}"
+  print -r -- "  last exit: ${LAST_EXIT:-unknown}"
+  print -r -- "  interval: ${INTERVAL:-unknown}"
+fi
 
 print -r -- ""
 print -r -- "Installed files:"
